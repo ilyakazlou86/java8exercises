@@ -1,7 +1,10 @@
 import java.io.File;
+import java.net.PasswordAuthentication;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
@@ -9,12 +12,14 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Scanner;
 import java.util.Set;
-import java.util.TreeMap;
-import java.util.TreeSet;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -22,7 +27,12 @@ import java.util.concurrent.atomic.LongAccumulator;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.BinaryOperator;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.LongStream;
+import java.util.stream.Stream;
 
 public class ExercisesChapter6 {
     
@@ -167,8 +177,6 @@ public class ExercisesChapter6 {
             String contents = new String(Files.readAllBytes(f.toPath()));
             List<String> words = Arrays.asList(contents.split("[\\P{L}]+"));
             words.parallelStream().forEach(w -> occurrences.merge(w,
-//                                                                  new HashSet<>(),
-//                                                                  (oldValue, newValue) -> oldValue).add(f));
                                                                   Collections.singleton(f),
                                                                   (oldValue, newValue) -> {
                                                                       Set<File> result = new HashSet<>(oldValue);
@@ -204,7 +212,7 @@ public class ExercisesChapter6 {
             String contents = new String(Files.readAllBytes(f.toPath()));
             List<String> words = Arrays.asList(contents.split("[\\P{L}]+"));
             words.parallelStream().forEach(w -> occurrences.computeIfAbsent(w,
-                                                                            key -> new HashSet<File>())
+                                                                            key -> ConcurrentHashMap.newKeySet())
                                                            .add(f));    
         }));
         return occurrences;
@@ -215,26 +223,17 @@ public class ExercisesChapter6 {
         File[] sources = new File(System.getProperty("java.home")).listFiles(f -> f.isFile() && f.getName()
                                                                                                  .toLowerCase()
                                                                                                  .endsWith(".txt"));
-        for (int i = 0; ; i++) {
-            if (i != 0 && i % 10_000 == 0)
-                System.out.printf("%d loops OK\n", i);
-            Map<String, Set<File>> res1 = getOccurrences(Arrays.asList(sources));
-            Map<String, Set<File>> res2 = getOccurrences2(Arrays.asList(sources));
-            for (Map.Entry<String, Set<File>> entry : res1.entrySet()) {
-                Set<File> set1 = entry.getValue();
-                Set<File> set2 = res2.get(entry.getKey());
-                if (!set1.equals(set2)) {
-                    System.out.println("WTF!");
-                    System.exit(1);
-                }
-            }
-        }
-//        Map<String, Set<File>> occurrences = getOccurrences2(Arrays.asList(sources));
-//        String key = "JavaFX";
-//        if (occurrences.containsKey(key))
-//            System.out.printf("Word \"%s\" occurs in files: %s\n", key, occurrences.get(key));
-//        else
-//            System.out.printf("Word \"%s\" doesn't occur in any file\n", key);
+        Map<String, Set<File>> occurrences = getOccurrences2(Arrays.asList(sources));
+        String key = "JavaFX";
+        if (occurrences.containsKey(key))
+            System.out.printf("Word \"%s\" occurs in files: %s\n", key, occurrences.get(key));
+        else
+            System.out.printf("Word \"%s\" doesn't occur in any file\n", key);
+        /*
+         * Looks like computeIfAbsent works much faster than merge. I'm not quite sure why, but I suppose
+         * the problem is in expensive remappingFunction for merge. Anyway, computeIfAbsent generates new
+         * value for empty keys only when necessary. This is a huge advantage.
+         */
     }
     
     /**
@@ -244,7 +243,12 @@ public class ExercisesChapter6 {
      */
     private static void exercise07() {
         System.out.println("Result:");
-        
+        ConcurrentHashMap<String, Long> source = new ConcurrentHashMap<>();
+        Random rnd = new Random();
+        rnd.longs(0L, 1000L).limit(100L)
+                            .forEach(x -> source.put("Key" + String.valueOf(x), x));
+        Map.Entry<String, ?> result = source.reduceEntries(8L, (e1, e2) -> e1.getValue() > e2.getValue() ? e1 : e2);
+        System.out.printf("The key with maximum value: %s\n", result.getKey());
     }
     
     /**
@@ -252,22 +256,66 @@ public class ExercisesChapter6 {
      * How large does an array have to be for Arrays.parallelSort to be faster than
      * Arrays.sort on your computer?
      */
-    private static void exercise08() {
+    private static void exercise08() throws Exception {
         System.out.println("Result:");
-        
+        int size = 1_000_000;
+        int length = 2;
+        Runnable sequentialSortTask = () -> {
+            Arrays.sort(new Random().ints().limit(length).toArray());
+        };
+        Runnable parallelSortTask = () -> {
+            Arrays.parallelSort(new Random().ints().limit(length).toArray());
+        };
+        getStatistics("Sequential sort time", sequentialSortTask, size);
+        Thread.sleep(1000L); // let gc do the stuff
+        getStatistics("Parallel sort time", parallelSortTask, size);
+        /*
+         * LOL, parallelSort is always faster on my machine :)
+         */
     }
     
     /**
      * Exercise 9.
      * You can use the parallelPrefix method to parallelize the computation of
      * Fibonacci numbers. We use the fact that the nth Fibonacci number is the top
-     * left coefficient of Fn, where F = ( 11 10 ) . Make an array filled with 2 × 2
+     * left coefficient of Fn, where F = ( 1 1 ; 1 0 ) . Make an array filled with 2 × 2
      * matrices. Define a Matrix class with a multiplication method, use parallelSetAll to
      * make an array of matrices, and use parallelPrefix to multiply them.
      */
+    private static class FibonacciMatrix {
+        private static long[][] init = { {1L, 1L}, {1L, 0L} };
+        private long[][] elements;
+        
+        public FibonacciMatrix(long[][] elements) {
+            this.elements = elements;
+        }
+        
+        public long getFibonacciNumber() {
+            return elements[0][0];
+        }
+        
+        public static FibonacciMatrix init(int i) {
+            return new FibonacciMatrix(init);
+        }
+        
+        public static FibonacciMatrix mult(FibonacciMatrix m1, FibonacciMatrix m2) {
+            long[][] result = new long[2][2];
+            for (int i = 0; i < 2; i++)
+                for (int j = 0; j < 2; j++)
+                    for (int k= 0; k < 2; k++)
+                        result[i][j] += m1.elements[i][k] * m2.elements[k][j];
+            return new FibonacciMatrix(result);
+        }
+    }
+    
     private static void exercise09() {
         System.out.println("Result:");
-        
+        int n = 10;
+        FibonacciMatrix[] source = new FibonacciMatrix[n];
+        Arrays.parallelSetAll(source, FibonacciMatrix::init);
+        Arrays.parallelPrefix(source, FibonacciMatrix::mult);
+        System.out.printf("First %d Fibonacci numbers:\n", n);
+        Stream.of(source).mapToLong(FibonacciMatrix::getFibonacciNumber).forEach(System.out::println);
     }
     
     /**
@@ -277,9 +325,52 @@ public class ExercisesChapter6 {
      * Don’t call get. To prevent your program from terminating prematurely, call
      *     ForkJoinPool.commonPool().awaitQuiescence(10, TimeUnit.SECONDS);
      */
-    private static void exercise10() {
+    private static CompletableFuture<String> readPage(String url) {
+        return CompletableFuture.supplyAsync(() -> {
+            try (Scanner scanner = new Scanner(new URL(url).openStream(),
+                                               StandardCharsets.UTF_8.toString())) {
+                scanner.useDelimiter("\\A");
+                return scanner.hasNext() ? scanner.next() : null;
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+    }
+    
+    private static CompletableFuture<Collection<String>> getLinks(String content) {
+        return CompletableFuture.supplyAsync(() -> {
+            String urlRegex = "(https?|ftp|file)://[-a-zA-Z0-9+&@#/%?=~_|!:,.;]*[-a-zA-Z0-9+&@#/%=~_|]";
+            Pattern urlPattern = Pattern.compile(urlRegex, Pattern.CASE_INSENSITIVE);
+            Matcher urlMatcher = urlPattern.matcher(content);
+            Collection<String> links = new ArrayList<>(urlMatcher.groupCount());
+            while (urlMatcher.find())
+                links.add(urlMatcher.group());
+            return links;
+        });
+    }
+    
+    private static Void handler(Collection<String> result, Throwable error) {
+        if (error != null) {
+            System.out.printf("Erorr: %s\n", error.getMessage());
+            return null;
+        }
+        if (result == null) {
+            System.out.println("Selected page has no links...");
+            return null;
+        }
+        System.out.println("Selected page has following links:");
+        result.stream().forEach(System.out::println);
+        return null;
+    }
+    
+    private static void exercise10() throws Exception {
         System.out.println("Result:");
-        
+        CompletableFuture<?> linksExtractor = CompletableFuture.completedFuture("https://google.com")
+                                                               .thenCompose(ExercisesChapter6::readPage)
+                                                               .thenCompose(ExercisesChapter6::getLinks)
+                                                               .handle(ExercisesChapter6::handler);
+        ForkJoinPool.commonPool().awaitQuiescence(10L, TimeUnit.SECONDS);
+        linksExtractor.join();
     }
     
     /**
@@ -293,9 +384,48 @@ public class ExercisesChapter6 {
      * and a function that simulates a validity check by sleeping for a second and
      * then checking that the password is "secret". Hint: Use recursion.
      */
-    private static void exercise11() {
+    public static <T> CompletableFuture<T> repeat(Executor exec, Supplier<T> action, Predicate<T> until) {
+        return CompletableFuture.supplyAsync(action, exec).thenCompose(auth -> {
+            if (until.test(auth)) {
+                System.out.println("You are logged in!");
+                return CompletableFuture.completedFuture(auth);
+            } else {
+                System.err.println("Wrong password!");
+                try {
+                    return repeat(exec, action, until);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }
+        });
+    }
+    
+    private static PasswordAuthentication login() {
+        System.out.print("Enter password: ");
+        try {
+            @SuppressWarnings("resource") Scanner scanner = new Scanner(System.in);
+            String password = scanner.nextLine();
+            return new PasswordAuthentication(null, password.toCharArray());
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+    
+    private static boolean validate(PasswordAuthentication auth) {
+        try {
+            Thread.sleep(1000L);
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        }
+        return Arrays.equals(auth.getPassword(), "secret".toCharArray());
+    }
+    
+    private static void exercise11() throws Exception {
         System.out.println("Result:");
-        
+        ExecutorService exec = Executors.newCachedThreadPool();
+        repeat(exec, ExercisesChapter6::login, ExercisesChapter6::validate);
+        exec.awaitTermination(1L, TimeUnit.MINUTES);
+        exec.shutdownNow();
     }
 
     public static void main(String[] args) throws Exception {
@@ -310,7 +440,7 @@ public class ExercisesChapter6 {
         System.out.println("\n*** Exercise 3 ***\nTask: " +
             "Generate 1,000 threads, each of which increments a counter 100,000 times.\r\n" + 
             "Compare the performance of using AtomicLong versus LongAdder.");
-//        exercise03();
+        exercise03();
         System.out.println("\n*** Exercise 4 ***\nTask: " +
             "Use a LongAccumulator to compute the maximum or minimum of the\r\n" + 
             "accumulated elements.");
@@ -329,14 +459,14 @@ public class ExercisesChapter6 {
             "ties arbitrarily). Hint: reduceEntries.");
         exercise07();
         System.out.println("\n*** Exercise 8 ***\nTask: " +
-            "How large does an array have to be for Arrays.parallelSort to be faster than\r\n" + 
+            "How large does an array have to be for Arrays.parallelSort to be faster than\r\n" +
             "Arrays.sort on your computer?");
         exercise08();
         System.out.println("\n*** Exercise 9 ***\nTask: " +
             "You can use the parallelPrefix method to parallelize the computation of\r\n" +
-            "Fibonacci numbers. We use the fact that the nth Fibonacci number is the top\r\n" + 
-            "left coefficient of Fn, where F = ( 11 10 ) . Make an array filled with 2 × 2\r\n" +
-            "matrices. Define a Matrix class with a multiplication method, use parallelSetAll to\r\n" + 
+            "Fibonacci numbers. We use the fact that the nth Fibonacci number is the top\r\n" +
+            "left coefficient of Fn, where F = ( 1 1 ; 1 0 ) . Make an array filled with 2 × 2\r\n" +
+            "matrices. Define a Matrix class with a multiplication method, use parallelSetAll to\r\n" +
             "make an array of matrices, and use parallelPrefix to multiply them.");
         exercise09();
         System.out.println("\n*** Exercise 10 ***\nTask: " +
